@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.2
+
+Tested end to end on Windows 10 with the official Discord app.
+
+- Windows: the setup's check marks showed as empty boxes in the Command Prompt; it now prints plain `OK`/`X` there. Output the console or a redirected file can't encode no longer crashes.
+- Windows: if the settings file has a mistake, the background copy now writes the reason to its log file instead of silently not starting. `setup.bat` says so when its test finds a problem instead of always printing "All set!".
+- Settings files saved as "UTF-8 with BOM" (Notepad, PowerShell) are read correctly; a damaged settings file gives a clear message.
+
 ## 1.0.1
 
 - Fix: the status could stay empty when your Navidrome username was typed with different capitalization than your account (Navidrome accepts either at login, but reports playback under the stored spelling). Usernames and player names now match regardless of case, and setup saves the server's spelling.

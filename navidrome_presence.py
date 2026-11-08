@@ -45,7 +45,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 CLIENT_NAME = "navidrome-presence"
 USER_AGENT = f"{CLIENT_NAME}/{__version__}"
 
@@ -118,10 +118,15 @@ def load_config(path: Optional[str]) -> Tuple[Config, str]:
         )
 
     cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#", ";"))
-    cp.read(found, encoding="utf-8")
     # Passwords are read without inline-comment stripping, so "pa ss #1" stays intact.
     raw = configparser.ConfigParser(interpolation=None)
-    raw.read(found, encoding="utf-8")
+    try:
+        cp.read(found, encoding="utf-8-sig")
+        raw.read(found, encoding="utf-8-sig")
+    except (configparser.Error, UnicodeDecodeError) as e:
+        reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+        raise SystemExit(f"Can't read {found}: {reason} Compare it with config.example.ini, "
+                         "or delete it and run setup again.") from None
 
     def get(section: str, key: str, default: Optional[str] = None) -> str:
         env = os.environ.get(f"NDP_{section}_{key}".upper())
@@ -942,8 +947,11 @@ class Publisher:
             if self.last is not None:
                 log.info("Clearing presence")
         else:
-            log.info("Presence: %s — %s%s", desired.get("details"), desired.get("state"),
-                     "" if desired.get("timestamps") else " (no timer)")
+            starts = [((d or {}).get("timestamps") or {}).get("start") for d in (desired, self.last)]
+            refresh = same_track and self.sent_once and (  # keepalive resend: only worth a line with -v
+                starts[0] == starts[1] or (None not in starts and abs(starts[0] - starts[1]) <= self.SEEK_TOLERANCE))
+            (log.debug if refresh else log.info)("Presence: %s — %s%s", desired.get("details"), desired.get("state"),
+                                                 "" if desired.get("timestamps") else " (no timer)")
             log.debug("activity payload: %s", json.dumps(desired, ensure_ascii=False))
 
         try:
@@ -1133,6 +1141,31 @@ log_level = INFO
 """
 
 
+# Plain fallbacks for symbols the setup prints. The Windows console font (Consolas) has no ✔/✘,
+# and redirected output there is usually cp1252, which can't encode them at all.
+_PLAIN_SYMBOLS = {"✔": "OK", "✘": "X", "→": "->", "•": "*", "—": "-", "–": "-", "…": "...", "·": "-", "⏸": "||"}
+_WINDOWS_SYMBOLS = ("✔", "✘")
+
+
+def console_text(text: str, stream: Any = None) -> str:
+    """Make `text` safe to print: plain symbols on Windows, and nothing the stream can't encode."""
+    stream = sys.stdout if stream is None else stream
+    if sys.platform == "win32":
+        for sym in _WINDOWS_SYMBOLS:
+            text = text.replace(sym, _PLAIN_SYMBOLS[sym])
+    enc = getattr(stream, "encoding", None)
+    if enc:
+        try:
+            text.encode(enc)
+        except UnicodeEncodeError:
+            for sym, plain in _PLAIN_SYMBOLS.items():
+                text = text.replace(sym, plain)
+            text = text.encode(enc, "replace").decode(enc, "replace")
+        except LookupError:
+            pass
+    return text
+
+
 def default_config_path() -> str:
     if sys.platform == "win32":
         return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "navidrome-presence", "config.ini")
@@ -1161,8 +1194,11 @@ def navidrome_reachable(url: str, timeout: float = 8.0) -> bool:
         return False
 
 
-def cmd_setup(path: str, ask: Any = input, ask_secret: Any = None, say: Any = print) -> int:
+def cmd_setup(path: str, ask: Any = input, ask_secret: Any = None, say: Any = None) -> int:
     import getpass
+    if say is None:
+        def say(text: str = "") -> None:
+            print(console_text(text), flush=True)
     ask_secret = ask_secret or getpass.getpass
     env = os.environ.get
 
@@ -1287,18 +1323,45 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
 
-    if args.setup is not None:
-        return cmd_setup(args.setup or args.config or default_config_path())
+    for stream in (sys.stdout, sys.stderr):  # e.g. a Japanese title logged to a cp1252 pipe on Windows
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
 
-    cfg, path = load_config(args.config)
-    log_file = args.log_file
-    if not log_file and sys.stderr is None:  # Windows background (pythonw): no console, so keep a log file
-        log_file = os.path.join(os.path.dirname(os.path.abspath(path)), "navidrome-presence.log")
+    if args.setup is not None:
+        try:
+            return cmd_setup(args.setup or args.config or default_config_path())
+        except KeyboardInterrupt:  # Ctrl+C: no traceback for a cancelled setup
+            print("\nSetup cancelled.")
+            return 1
+
+    def pick_log_file(config_path: str) -> Optional[str]:
+        if args.log_file:
+            return args.log_file
+        if sys.stderr is None:  # Windows background (pythonw): no console, so keep a log file
+            return os.path.join(os.path.dirname(os.path.abspath(config_path)), "navidrome-presence.log")
+        return None
+
+    try:
+        cfg, path = load_config(args.config)
+    except SystemExit as e:
+        # A settings problem. Without a console (pythonw) the message would vanish, so leave it in the log.
+        log_file = pick_log_file(args.config or default_config_path())
+        if log_file and sys.stderr is None and isinstance(e.code, str):
+            configure_logging(logging.ERROR, log_file)
+            log.error("Can't start: %s", e.code)
+        raise
+    log_file = pick_log_file(path)
     configure_logging(logging.DEBUG if args.verbose else getattr(logging, cfg.log_level, logging.INFO), log_file)
     log.debug("config: %s", path)
 
     if args.check:
-        return cmd_check(cfg)
+        try:
+            return cmd_check(cfg)
+        except KeyboardInterrupt:
+            return 1
 
     app = App(cfg, dry_run=args.dry_run)
 
