@@ -415,8 +415,11 @@ class TestEndToEnd(Base):
         time.sleep(0.05)
         self.assertEqual(len(self.discord.activities), 1)
         time.sleep(0.25)
-        app.tick()
+        with self.assertLogs(ndp.log, level="DEBUG") as logs:
+            app.tick()
         self.assertEqual(len(self.wait_for(2)), 2)
+        presence = [r for r in logs.records if r.getMessage().startswith("Presence:")]
+        self.assertEqual([r.levelname for r in presence], ["DEBUG"])  # resends don't fill the log
 
     def test_navidrome_outage_clears_after_three_failures(self):
         app = self.app()
@@ -660,6 +663,14 @@ class TestSetupWizard(unittest.TestCase):
         self.assertIn("run setup again", out)
         self.assertFalse(os.path.exists(self.path))
 
+    def test_ctrl_c_cancels_without_a_traceback(self):
+        import io
+        from unittest import mock
+        out = io.StringIO()
+        with mock.patch.object(ndp, "cmd_setup", side_effect=KeyboardInterrupt), mock.patch.object(ndp.sys, "stdout", out):
+            self.assertEqual(ndp.main(["--setup", self.path]), 1)
+        self.assertIn("Setup cancelled.", out.getvalue())
+
     def test_normalize_url(self):
         self.assertEqual(ndp.normalize_url(" 192.168.1.10:4533/ "), "http://192.168.1.10:4533")
         self.assertEqual(ndp.normalize_url("https://music.example.com/app/#/album/x"), "https://music.example.com")
@@ -694,6 +705,41 @@ class TestLogging(unittest.TestCase):
             ndp.main(["-c", cfgp, "--check"])
         self.assertEqual(seen["lf"], os.path.join(d, "navidrome-presence.log"))
 
+    def test_settings_error_under_pythonw_lands_in_the_log(self):
+        from unittest import mock
+        d = tempfile.mkdtemp()
+        cfgp = os.path.join(d, "config.ini")
+        with open(cfgp, "w") as f:
+            f.write("url = no section header\n")
+        with mock.patch.object(ndp.sys, "stderr", None), self.assertRaises(SystemExit):
+            ndp.main(["-c", cfgp])
+        for h in logging.getLogger().handlers:
+            h.flush()
+        with open(os.path.join(d, "navidrome-presence.log"), encoding="utf-8") as f:
+            self.assertIn("Can't start: Can't read", f.read())
+
+
+class TestConsoleText(unittest.TestCase):
+    class Stream:
+        def __init__(self, encoding):
+            self.encoding = encoding
+
+    def test_windows_console_gets_plain_check_marks_but_keeps_accents(self):
+        from unittest import mock
+        with mock.patch.object(ndp.sys, "platform", "win32"):
+            out = ndp.console_text("  ✔ Logged in as José — ok", self.Stream("utf-8"))
+        self.assertEqual(out, "  OK Logged in as José — ok")
+
+    def test_unencodable_output_is_simplified_instead_of_crashing(self):
+        out = ndp.console_text("Navidrome → Discord ✔ 日本", self.Stream("cp1252"))
+        self.assertEqual(out, "Navidrome -> Discord OK ??")
+        out.encode("cp1252")
+
+    def test_unicode_terminals_are_left_alone(self):
+        from unittest import mock
+        with mock.patch.object(ndp.sys, "platform", "linux"):
+            self.assertEqual(ndp.console_text("  ✔ Found it", self.Stream("utf-8")), "  ✔ Found it")
+
 
 class TestConfig(unittest.TestCase):
     def write(self, text):
@@ -715,6 +761,13 @@ class TestConfig(unittest.TestCase):
         cfg, _ = ndp.load_config(self.write("[navidrome]\nurl=http://x\nusername=a\npassword = p@ss #1; x\n[discord]\nclient_id=123  # my app\n"))
         self.assertEqual(cfg.password, "p@ss #1; x")
         self.assertEqual(cfg.client_id, "123")  # inline comments still work elsewhere
+
+    def test_utf8_bom_from_notepad_is_accepted(self):
+        fd, p = tempfile.mkstemp(suffix=".ini")
+        with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
+            f.write("[navidrome]\nurl=http://x\nusername=a\npassword=pässword\n[discord]\nclient_id=123\n")
+        cfg, _ = ndp.load_config(p)
+        self.assertEqual((cfg.watch_user, cfg.password), ("a", "pässword"))
 
     def test_env_override_and_validation(self):
         p = self.write("[navidrome]\nurl=http://x:4533/\nusername=a\npassword=b\n[discord]\nclient_id=123\n")
