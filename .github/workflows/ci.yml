@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck -S warning install-macos.sh install-linux.sh proxmox/create-lxc.sh proxmox/setup-proxmox.template.sh proxmox/build.sh
+      - name: Generated installer is up to date
+        run: |
+          bash proxmox/build.sh
+          git diff --exit-code proxmox/setup-proxmox.sh || { echo "::error::Run 'bash proxmox/build.sh' and commit proxmox/setup-proxmox.sh"; exit 1; }
