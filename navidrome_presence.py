@@ -45,7 +45,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 CLIENT_NAME = "navidrome-presence"
 USER_AGENT = f"{CLIENT_NAME}/{__version__}"
 
@@ -748,6 +748,11 @@ def parse_entry(e: Dict[str, Any]) -> Track:
     )
 
 
+def is_watched_user(entry: Dict[str, Any], watch_user: str) -> bool:
+    user = entry.get("username")
+    return not user or str(user).casefold() == watch_user.casefold()
+
+
 class Selector:
     """Picks the entry to show and estimates position on servers without positionMs."""
 
@@ -758,13 +763,17 @@ class Selector:
 
     def pick(self, entries: List[Dict[str, Any]], now: float) -> Optional[Tuple[Track, float]]:
         tracks: List[Track] = []
+        # Navidrome logins ignore case ("tim" logs in as "Tim"), but now-playing entries carry the
+        # stored spelling — so compare case-insensitively or a user's own playback gets filtered out.
+        players = {p.casefold() for p in self.cfg.players}
+        ignored = {p.casefold() for p in self.cfg.ignore_players}
         for e in entries:
-            if e.get("username") and e.get("username") != self.cfg.watch_user:
+            if not is_watched_user(e, self.cfg.watch_user):
                 continue
-            player = e.get("playerName") or ""
-            if self.cfg.players and player not in self.cfg.players:
+            player = (e.get("playerName") or "").casefold()
+            if players and player not in players:
                 continue
-            if player in self.cfg.ignore_players:
+            if player in ignored:
                 continue
             if e.get("isVideo"):
                 continue
@@ -1060,11 +1069,15 @@ def cmd_check(cfg: Config) -> int:
         r = nd.ping()
         log.info("Navidrome OK: %s %s (OpenSubsonic: %s)", r.get("type", "server"), r.get("serverVersion", ""), r.get("openSubsonic", False))
         entries = nd.now_playing()
-        mine = [e for e in entries if e.get("username") in (None, cfg.watch_user)]
+        mine = [e for e in entries if is_watched_user(e, cfg.watch_user)]
         log.info("Now playing for %s: %d entr%s", cfg.watch_user, len(mine), "y" if len(mine) == 1 else "ies")
         for e in mine:
             log.info("  • %s — %s [%s, player=%s, state=%s, positionMs=%s]", e.get("artist"), e.get("title"),
                      e.get("album"), e.get("playerName"), e.get("state", "n/a"), e.get("positionMs", "n/a"))
+        if not mine:
+            others = len(entries)
+            log.info("  Tip: start a song in your Navidrome app, then run this check again to see it listed here.%s",
+                     f" ({others} other user{'s are' if others != 1 else ' is'} playing right now.)" if others else "")
     except NavidromeError as e:
         ok = False
         log.error("Navidrome check failed: %s", e)
@@ -1183,7 +1196,12 @@ def cmd_setup(path: str, ask: Any = input, ask_secret: Any = None, say: Any = pr
         user = prompt("Username", key_u).strip()
         pw = prompt("Password (hidden as you type)", key_p, secret=True)
         try:
-            Navidrome(url, user, pw).ping()
+            nd = Navidrome(url, user, pw)
+            nd.ping()
+            try:  # Navidrome logins ignore case; save the spelling the server actually uses
+                user = (nd.call("getUser", username=user).get("user") or {}).get("username") or user
+            except NavidromeError:
+                pass
             say(f"  ✔ Logged in as {user}")
             break
         except NavidromeError:
@@ -1232,6 +1250,29 @@ def cmd_setup(path: str, ask: Any = input, ask_secret: Any = None, say: Any = pr
     return 0
 
 
+def configure_logging(level: int, log_file: Optional[str] = None) -> None:
+    import logging.handlers
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    if sys.stderr is not None:
+        h = logging.StreamHandler()
+        h.setFormatter(fmt)
+        root.addHandler(h)
+    if log_file:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+            fh = logging.handlers.RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=1, encoding="utf-8")
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+        except OSError:
+            pass
+    if not root.handlers:
+        root.addHandler(logging.NullHandler())
+    root.setLevel(level)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Navidrome → Discord Rich Presence over local IPC (no user token).")
     ap.add_argument("-c", "--config", help="path to config.ini")
@@ -1241,6 +1282,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--once", action="store_true", help="run a single poll and exit")
     ap.add_argument("--check", action="store_true", help="test the Navidrome login and the Discord connection, then exit")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    ap.add_argument("--log-file", metavar="PATH",
+                    help="also write the log to this file (automatic when running without a console, e.g. pythonw)")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
 
@@ -1248,8 +1291,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_setup(args.setup or args.config or default_config_path())
 
     cfg, path = load_config(args.config)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else getattr(logging, cfg.log_level, logging.INFO),
-                        format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    log_file = args.log_file
+    if not log_file and sys.stderr is None:  # Windows background (pythonw): no console, so keep a log file
+        log_file = os.path.join(os.path.dirname(os.path.abspath(path)), "navidrome-presence.log")
+    configure_logging(logging.DEBUG if args.verbose else getattr(logging, cfg.log_level, logging.INFO), log_file)
     log.debug("config: %s", path)
 
     if args.check:

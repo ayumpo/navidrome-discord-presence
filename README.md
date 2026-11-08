@@ -110,7 +110,13 @@ You need Python 3, which almost every distro already has. Flatpak, Snap and Vesk
 2. Download this project: green **Code** button → **Download ZIP**. Unzip it somewhere permanent, for example `Documents\navidrome-discord-presence`.
 3. Open the `windows` folder and double-click **`setup.bat`**. Answer the questions.
 
-It then runs in the background and starts when you log in to Windows. To remove it, double-click **`windows\remove.bat`**. Windows support is new, so please [open an issue](https://github.com/ayumpo/navidrome-discord-presence/issues) if anything goes wrong.
+It then runs in the background and starts when you log in to Windows. Run `setup.bat` again any time to update or restart it.
+
+- **Not showing up?** Start a song, then double-click **`windows\troubleshoot.bat`**. It runs in a window and shows exactly what it sees. Look for lines starting with `Presence:`.
+- **Log file:** double-click **`windows\show-log.bat`**.
+- **Remove:** double-click **`windows\remove.bat`**.
+
+Windows support is new, so please [open an issue](https://github.com/ayumpo/navidrome-discord-presence/issues) (with the log) if anything goes wrong.
 
 ## What you'll see
 
