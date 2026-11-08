@@ -4,6 +4,7 @@ Run:  python3 -m unittest discover -s tests -v
 """
 import hashlib
 import json
+import logging
 import os
 import socket
 import struct
@@ -130,7 +131,7 @@ class FakeNavidrome:
                 u = urllib.parse.urlparse(self.path)
                 q = dict(urllib.parse.parse_qsl(u.query))
                 outer.requests.append((u.path, q))
-                ok_auth = q.get("u") == outer.user and q.get("t") == hashlib.md5(
+                ok_auth = q.get("u", "").casefold() == outer.user.casefold() and q.get("t") == hashlib.md5(
                     (outer.password + q.get("s", "")).encode()).hexdigest()
                 base = {"status": "ok", "version": "1.16.1", "type": "navidrome",
                         "serverVersion": "0.63.2", "openSubsonic": True}
@@ -138,6 +139,8 @@ class FakeNavidrome:
                     base = {"status": "failed", "error": {"code": 99, "message": "plaintext password sent"}}
                 elif not ok_auth:
                     base = {"status": "failed", "error": {"code": 40, "message": "Wrong username or password"}}
+                elif u.path.endswith("/getUser.view"):
+                    base["user"] = {"username": outer.user, "adminRole": False}
                 elif u.path.endswith("/getNowPlaying.view"):
                     base["nowPlaying"] = {"entry": list(outer.entries)} if outer.entries else {}
                 body = json.dumps({"subsonic-response": base}).encode()
@@ -352,6 +355,13 @@ class TestEndToEnd(Base):
         self.nav.entries.append(entry(title="Mine"))
         app.tick()
         self.assertEqual(self.wait_for(2)[-1]["details"], "Mine")
+
+    def test_username_and_player_matching_ignores_case(self):
+        # Navidrome accepts "alice" for an account stored as "Alice" and reports entries as "Alice".
+        app = self.app(watch_user="alice", players=["narjo"])
+        self.nav.entries = [entry(username="Alice", playerName="Narjo", title="Case Test")]
+        app.tick()
+        self.assertEqual(self.wait_for(1)[-1]["details"], "Case Test")
 
     def test_prefers_playing_over_paused(self):
         app = self.app()
@@ -631,6 +641,12 @@ class TestSetupWizard(unittest.TestCase):
         self.assertEqual(cfg.artwork_sources, ["caa", "deezer", "itunes"])
         self.assertEqual((cfg.links, cfg.status_display, cfg.activity_name_template), ("spotify", 2, "{artist} - {track}"))
 
+    def test_saves_the_servers_spelling_of_the_username(self):
+        rc, out = self.run_wizard([self.nav.url, "ALICE", "12345678901234567890", "n"], ["p@ss #1;{x}"])
+        self.assertEqual(rc, 0, out)
+        cfg, _ = ndp.load_config(self.path)
+        self.assertEqual(cfg.username, "alice")
+
     def test_retries_wrong_password_and_defaults_to_navidrome_covers(self):
         rc, out = self.run_wizard([self.nav.url, "alice", "alice", "12345678901234567890", ""], ["wrong", "p@ss #1;{x}"])
         self.assertEqual(rc, 0, out)
@@ -648,6 +664,35 @@ class TestSetupWizard(unittest.TestCase):
         self.assertEqual(ndp.normalize_url(" 192.168.1.10:4533/ "), "http://192.168.1.10:4533")
         self.assertEqual(ndp.normalize_url("https://music.example.com/app/#/album/x"), "https://music.example.com")
         self.assertEqual(ndp.normalize_url("http://nas:4533/rest/ping.view"), "http://nas:4533")
+
+
+class TestLogging(unittest.TestCase):
+    def tearDown(self):
+        ndp.configure_logging(logging.WARNING)
+
+    def test_log_file_when_running_without_a_console(self):
+        from unittest import mock
+        path = os.path.join(tempfile.mkdtemp(), "sub", "navidrome-presence.log")
+        with mock.patch.object(ndp.sys, "stderr", None):
+            ndp.configure_logging(logging.INFO, path)
+            ndp.log.info("hello from pythonw ✔")
+        for h in logging.getLogger().handlers:
+            h.flush()
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("hello from pythonw ✔", f.read())
+
+    def test_main_picks_a_log_file_next_to_the_config_under_pythonw(self):
+        from unittest import mock
+        d = tempfile.mkdtemp()
+        cfgp = os.path.join(d, "config.ini")
+        with open(cfgp, "w") as f:
+            f.write("[navidrome]\nurl=http://127.0.0.1:9\nusername=a\npassword=b\n[discord]\nclient_id=123\n")
+        seen = {}
+        with mock.patch.object(ndp.sys, "stderr", None), \
+             mock.patch.object(ndp, "configure_logging", side_effect=lambda lvl, lf=None: seen.update(lf=lf)), \
+             mock.patch.object(ndp, "cmd_check", return_value=0):
+            ndp.main(["-c", cfgp, "--check"])
+        self.assertEqual(seen["lf"], os.path.join(d, "navidrome-presence.log"))
 
 
 class TestConfig(unittest.TestCase):
