@@ -42,12 +42,20 @@ powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $
 echo.
 echo Testing - if Discord is open, a test status shows on your profile for 15 seconds...
 %PY% "%DIR%\navidrome_presence.py" -c "%CFG%" --check
+set "CHECK_FAILED="
+if errorlevel 1 set "CHECK_FAILED=1"
 
 > "%STARTUP%\navidrome-presence.cmd" echo @start "" %PYW% "%DIR%\navidrome_presence.py" -c "%CFG%"
 start "" %PYW% "%DIR%\navidrome_presence.py" -c "%CFG%"
 
 echo.
-echo All set! It now runs in the background and starts when you log in to Windows.
+if defined CHECK_FAILED (
+  echo The test above found a problem - read the message, it says what to fix.
+  echo navidrome-presence still runs in the background and keeps retrying.
+  echo If the problem is in your settings, fix them, then run setup.bat again.
+) else (
+  echo All set! It now runs in the background and starts when you log in to Windows.
+)
 echo  - In Discord: Settings - Activity Privacy - turn on "Share my activity".
 echo  - Play a song in your Navidrome app; your status updates within a few seconds.
 echo  - Not showing up? Double-click troubleshoot.bat while a song plays.
